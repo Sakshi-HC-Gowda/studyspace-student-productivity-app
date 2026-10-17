@@ -1,0 +1,88 @@
+import { describe, expect, it } from 'vitest';
+import {
+  addDays,
+  daysBetweenKeys,
+  endOfWeek,
+  formatMinutes,
+  formatWeekRange,
+  fromDateKey,
+  isDateKey,
+  isInWeekOf,
+  startOfWeek,
+  toDateKey,
+} from './dates';
+
+// 2026-03-04 is a Wednesday; the containing ISO week runs Mon 2026-03-02 …
+// Sun 2026-03-08, i.e. it ends Mon 2026-03-09 00:00 local.
+const WEDNESDAY = new Date(2026, 2, 4, 15, 30);
+
+describe('dates', () => {
+  it('builds local calendar keys without timezone drift', () => {
+    expect(toDateKey(WEDNESDAY)).toBe('2026-03-04');
+    expect(toDateKey(new Date(2026, 0, 1, 0, 0))).toBe('2026-01-01');
+    expect(toDateKey(new Date(2026, 11, 31, 23, 59))).toBe('2026-12-31');
+  });
+
+  it('rejects impossible or malformed date keys', () => {
+    expect(isDateKey('2026-03-04')).toBe(true);
+    expect(isDateKey('2026-02-31')).toBe(false);
+    expect(isDateKey('2026-13-01')).toBe(false);
+    expect(isDateKey('04/03/2026')).toBe(false);
+    expect(isDateKey('')).toBe(false);
+    expect(fromDateKey('nonsense')).toBeNull();
+  });
+
+  it('starts weeks on Monday at local midnight', () => {
+    const monday = startOfWeek(WEDNESDAY);
+    expect(toDateKey(monday)).toBe('2026-03-02');
+    expect(monday.getHours()).toBe(0);
+    expect(monday.getMinutes()).toBe(0);
+
+    const sunday = new Date(2026, 2, 8, 22, 0);
+    expect(toDateKey(startOfWeek(sunday))).toBe('2026-03-02');
+
+    const mondayItself = new Date(2026, 2, 2, 9, 0);
+    expect(toDateKey(startOfWeek(mondayItself))).toBe('2026-03-02');
+  });
+
+  it('ends weeks exactly seven days after the Monday start', () => {
+    expect(toDateKey(addDays(endOfWeek(WEDNESDAY), -1))).toBe('2026-03-08');
+    expect(endOfWeek(WEDNESDAY).getTime() - startOfWeek(WEDNESDAY).getTime()).toBe(
+      7 * 86_400_000,
+    );
+  });
+
+  it('tests week membership on the exact boundaries', () => {
+    const start = new Date(2026, 2, 2, 0, 0, 0);
+    const lastMoment = new Date(2026, 2, 8, 23, 59, 59);
+    const nextMonday = new Date(2026, 2, 9, 0, 0, 0);
+    const previousSunday = new Date(2026, 2, 1, 23, 59, 59);
+
+    expect(isInWeekOf(start.toISOString(), WEDNESDAY)).toBe(true);
+    expect(isInWeekOf(lastMoment.toISOString(), WEDNESDAY)).toBe(true);
+    expect(isInWeekOf(nextMonday.toISOString(), WEDNESDAY)).toBe(false);
+    expect(isInWeekOf(previousSunday.toISOString(), WEDNESDAY)).toBe(false);
+    expect(isInWeekOf('not a date', WEDNESDAY)).toBe(false);
+  });
+
+  it('counts whole days between keys', () => {
+    expect(daysBetweenKeys('2026-03-04', '2026-03-06')).toBe(2);
+    expect(daysBetweenKeys('2026-03-04', '2026-03-04')).toBe(0);
+    expect(daysBetweenKeys('2026-03-06', '2026-03-04')).toBe(-2);
+  });
+
+  it('formats minute totals readably', () => {
+    expect(formatMinutes(0)).toBe('0m');
+    expect(formatMinutes(45)).toBe('45m');
+    expect(formatMinutes(60)).toBe('1h');
+    expect(formatMinutes(150)).toBe('2h 30m');
+    expect(formatMinutes(Number.NaN)).toBe('0m');
+  });
+
+  it('formats a week range', () => {
+    const range = formatWeekRange(WEDNESDAY);
+    // Locale-dependent order, so assert on content rather than arrangement.
+    expect(range).toContain('2');
+    expect(range).toContain('8');
+  });
+});

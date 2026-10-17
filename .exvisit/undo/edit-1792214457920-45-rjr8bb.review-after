@@ -1,0 +1,214 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { StudySession, Task, TaskInput } from '../types';
+import {
+  STORAGE_KEY,
+  clearState,
+  loadState,
+  saveState,
+  serializeState,
+  type LoadStatus,
+} from '../storage/storage';
+import { createId } from '../utils/id';
+import { applyTaskInput, createTask } from '../utils/tasks';
+import { createSession, pruneOrphanSessions, validateSessionDraft, type SessionErrors } from '../utils/study';
+
+export type NoticeLevel = 'info' | 'warning' | 'error';
+
+export interface Notice {
+  id: string;
+  level: NoticeLevel;
+  text: string;
+}
+
+export interface LogSessionOutcome {
+  ok: boolean;
+  errors: SessionErrors;
+}
+
+function notice(level: NoticeLevel, text: string): Notice {
+  return { id: createId(), level, text };
+}
+
+/**
+ * Owns the whole application state: loading once, auto-saving on every change,
+ * and turning storage problems into visible notices instead of crashes.
+ */
+export function useStudyspace() {
+  const [phase, setPhase] = useState<'loading' | 'ready'>('loading');
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [sessions, setSessions] = useState<StudySession[]>([]);
+  const [notices, setNotices] = useState<Notice[]>([]);
+  const [loadStatus, setLoadStatus] = useState<LoadStatus>('empty');
+  const [storageWritable, setStorageWritable] = useState(true);
+
+  /** Serialised snapshot of the last state that reached localStorage. */
+  const lastSavedRef = useRef<string | null>(null);
+
+  const dismissNotice = useCallback((id: string) => {
+    setNotices((current) => current.filter((entry) => entry.id !== id));
+  }, []);
+
+  const pushNotice = useCallback((level: NoticeLevel, text: string) => {
+    setNotices((current) => [...current, notice(level, text)]);
+  }, []);
+
+  // ---- load once, then auto-save -------------------------------------------------
+  useEffect(() => {
+    const result = loadState();
+    setTasks(result.data.tasks);
+    setSessions(result.data.sessions);
+    setLoadStatus(result.status);
+
+    const messages: Notice[] = [];
+    if (result.readError !== undefined) {
+      messages.push(notice('warning', `${result.readError} This tab keeps your changes in memory.`));
+      setStorageWritable(false);
+    }
+    const level: NoticeLevel = result.status === 'unreadable' ? 'error' : 'warning';
+    for (const issue of result.issues) {
+      if (result.readError !== undefined && issue === result.readError) continue;
+      messages.push(notice(level, issue));
+    }
+    if (result.status === 'unreadable') {
+      // Nothing valid was replaced: writes stay switched off until the user
+      // explicitly decides to clear what is stored.
+      setStorageWritable(false);
+    }
+    setNotices(messages);
+
+    // Nothing to write back when the payload already matched what we loaded.
+    lastSavedRef.current = result.shouldRewrite ? null : serializeState(result.data);
+    setPhase('ready');
+  }, []);
+
+  useEffect(() => {
+    if (phase !== 'ready' || !storageWritable) return;
+    const payload = { tasks, sessions };
+    const serialized = serializeState(payload);
+    if (serialized === lastSavedRef.current) return;
+
+    const result = saveState(payload);
+    if (result.ok) {
+      lastSavedRef.current = serialized;
+      return;
+    }
+    setStorageWritable(false);
+    pushNotice('error', result.error ?? 'The latest change could not be saved.');
+  }, [tasks, sessions, phase, storageWritable, pushNotice]);
+
+  // ---- keep other tabs of the same origin in step --------------------------------
+  useEffect(() => {
+    if (phase !== 'ready') return;
+    function onStorageEvent(event: StorageEvent) {
+      if (event.key !== null && event.key !== STORAGE_KEY) return;
+      const result = loadState();
+      if (result.status === 'unreadable') return;
+      setTasks(result.data.tasks);
+      setSessions(result.data.sessions);
+      lastSavedRef.current = serializeState(result.data);
+    }
+    window.addEventListener('storage', onStorageEvent);
+    return () => window.removeEventListener('storage', onStorageEvent);
+  }, [phase]);
+
+  // ---- actions -------------------------------------------------------------------
+  const addTask = useCallback((input: TaskInput) => {
+    const task = createTask(input, new Date(), createId());
+    setTasks((current) => [...current, task]);
+    return task;
+  }, []);
+
+  const updateTask = useCallback((id: string, input: TaskInput) => {
+    setTasks((current) =>
+      current.map((task) => (task.id === id ? applyTaskInput(task, input) : task)),
+    );
+  }, []);
+
+  const replaceTasks = useCallback((next: Task[]) => {
+    setTasks(next);
+  }, []);
+
+  const setTaskStatus = useCallback((id: string, status: Task['status']) => {
+    setTasks((current) => current.map((task) => (task.id === id ? { ...task, status } : task)));
+  }, []);
+
+  const toggleTaskDone = useCallback((id: string) => {
+    setTasks((current) =>
+      current.map((task) =>
+        task.id === id ? { ...task, status: task.status === 'done' ? 'todo' : 'done' } : task,
+      ),
+    );
+  }, []);
+
+  const deleteTask = useCallback((id: string) => {
+    setTasks((current) => {
+      const target = current.find((task) => task.id === id);
+      const next = current.filter((task) => task.id !== id);
+      setSessions((existing) => {
+        const { sessions: kept, removed } = pruneOrphanSessions(existing, next);
+        if (removed > 0) {
+          pushNotice(
+            'info',
+            `Deleted “${target?.title ?? 'task'}” and ${removed} study ${
+              removed === 1 ? 'session' : 'sessions'
+            } logged against it.`,
+          );
+        } else {
+          pushNotice('info', `Deleted “${target?.title ?? 'task'}”.`);
+        }
+        return kept;
+      });
+      return next;
+    });
+  }, [pushNotice]);
+
+  const logSession = useCallback(
+    (draft: { taskId: string; minutes: string }): LogSessionOutcome => {
+      const validation = validateSessionDraft(draft, tasks);
+      if (!validation.ok || validation.value === null) {
+        return { ok: false, errors: validation.errors };
+      }
+      const session = createSession(validation.value, new Date(), createId());
+      // Sessions are only ever added for a task that exists right now.
+      setSessions((current) => [...current, session]);
+      return { ok: true, errors: {} };
+    },
+    [tasks],
+  );
+
+  /** Deliberate, user-confirmed wipe of the stored payload. */
+  const resetStorage = useCallback(() => {
+    const result = clearState();
+    setTasks([]);
+    setSessions([]);
+    setStorageWritable(true);
+    lastSavedRef.current = null;
+    setNotices([
+      notice(
+        result.ok ? 'info' : 'warning',
+        result.ok
+          ? 'Stored data was cleared. Studyspace is starting fresh.'
+          : `${result.error ?? 'Stored data could not be cleared.'} The in-memory state was reset anyway.`,
+      ),
+    ]);
+  }, []);
+
+  return {
+    phase,
+    tasks,
+    sessions,
+    notices,
+    loadStatus,
+    storageWritable,
+    dismissNotice,
+    pushNotice,
+    addTask,
+    updateTask,
+    replaceTasks,
+    setTaskStatus,
+    toggleTaskDone,
+    deleteTask,
+    logSession,
+    resetStorage,
+  };
+}

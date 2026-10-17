@@ -1,0 +1,299 @@
+import { render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { App } from './App';
+import { STORAGE_KEY, STORAGE_VERSION } from './storage/storage';
+import type { StudySession, Task } from './types';
+import { toDateKey } from './utils/dates';
+
+/**
+ * End-to-end-ish workflow tests. They mount the real `App` (hooks, storage
+ * utility, components) and drive it the way a student would, then assert on
+ * what was written to the versioned localStorage key.
+ */
+
+interface StoredEnvelope {
+  version?: number;
+  tasks: Task[];
+  sessions: StudySession[];
+}
+
+function seedEnvelope(tasks: Task[], sessions: StudySession[] = []): void {
+  window.localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify({ version: STORAGE_VERSION, tasks, sessions }),
+  );
+}
+
+function readStored(): StoredEnvelope | null {
+  const raw = window.localStorage.getItem(STORAGE_KEY);
+  return raw === null ? null : (JSON.parse(raw) as StoredEnvelope);
+}
+
+function makeTask(overrides: Partial<Task> = {}): Task {
+  return {
+    id: 'seed-1',
+    title: 'Seeded task',
+    course: 'General',
+    priority: 'medium',
+    status: 'todo',
+    createdAt: '2026-10-01T08:00:00.000Z',
+    ...overrides,
+  };
+}
+
+/** Reads a summary card value from the card carrying that visible label. */
+function statValue(label: string): string {
+  const labelElement = screen.getByText(label, { selector: '.stat__label' });
+  return labelElement.closest('li')?.querySelector('.stat__value')?.textContent ?? '';
+}
+
+function quickAddForm(): HTMLElement {
+  return screen.getByRole('form', { name: 'Quick add' });
+}
+
+function tasksRegion(): HTMLElement {
+  return screen.getByRole('region', { name: 'All open tasks' });
+}
+
+async function renderApp(): Promise<void> {
+  render(<App />);
+  await waitFor(() => expect(screen.queryByText(/Loading your tasks/)).toBeNull());
+}
+
+async function quickAdd(user: ReturnType<typeof userEvent.setup>, title: string): Promise<void> {
+  await user.type(screen.getByLabelText('Task title'), title);
+  await user.click(within(quickAddForm()).getByRole('button', { name: 'Add task' }));
+  await screen.findByText(title);
+}
+
+beforeEach(() => {
+  window.localStorage.clear();
+  // jsdom has no layout engine, so the scroll-into-view call after "Log study"
+  // needs a stub. Nothing else about the flow changes.
+  Element.prototype.scrollIntoView = vi.fn();
+});
+
+describe('Studyspace dashboard workflows', () => {
+  it('captures a task with quick add and persists it under the versioned key', async () => {
+    const user = userEvent.setup();
+    await renderApp();
+
+    expect(statValue('Tasks tracked')).toBe('0');
+
+    await quickAdd(user, 'Finish biology problem set');
+
+    expect(screen.getByText('Finish biology problem set')).toBeInTheDocument();
+    expect(statValue('Tasks tracked')).toBe('1');
+    expect(statValue('Completed')).toBe('0');
+
+    await waitFor(() => {
+      const stored = readStored();
+      expect(stored?.tasks).toHaveLength(1);
+    });
+    const stored = readStored();
+    expect(stored?.version).toBe(STORAGE_VERSION);
+    expect(stored?.tasks[0]).toMatchObject({
+      title: 'Finish biology problem set',
+      course: 'General',
+      priority: 'medium',
+      status: 'todo',
+    });
+    expect(stored?.tasks[0]?.id).toBeTruthy();
+    expect(stored?.tasks[0]?.createdAt).toBeTruthy();
+    // Optional fields stay absent rather than being invented.
+    expect(stored?.tasks[0]).not.toHaveProperty('dueDate');
+    expect(stored?.tasks[0]).not.toHaveProperty('estimatedMinutes');
+  });
+
+  it('refuses a blank title and stores nothing', async () => {
+    const user = userEvent.setup();
+    await renderApp();
+
+    await user.click(within(quickAddForm()).getByRole('button', { name: 'Add task' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Give the task a title first.');
+    expect(readStored()?.tasks ?? []).toHaveLength(0);
+  });
+
+  it('completes a task, moves it out of the open list and into Completed', async () => {
+    const user = userEvent.setup();
+    await renderApp();
+    await quickAdd(user, 'Read chapter 4');
+
+    await user.click(screen.getByRole('checkbox', { name: /Mark .*Read chapter 4.* as done/ }));
+
+    expect(statValue('Completed')).toBe('1');
+    await waitFor(() => expect(screen.queryByText('Read chapter 4')).toBeNull());
+    await waitFor(() => expect(readStored()?.tasks[0]?.status).toBe('done'));
+
+    await user.click(screen.getByRole('button', { name: /^Completed/ }));
+    expect(await screen.findByText('Read chapter 4')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Completed' })).toBeInTheDocument();
+  });
+
+  it('logs study minutes against an existing task and totals them for the week', async () => {
+    const user = userEvent.setup();
+    await renderApp();
+    await quickAdd(user, 'Statistics revision');
+
+    const taskId = readStored()?.tasks[0]?.id ?? '';
+    expect(taskId).not.toBe('');
+
+    await user.click(screen.getByRole('button', { name: 'Log study' }));
+    await waitFor(() =>
+      expect((screen.getByLabelText('Task you studied') as HTMLSelectElement).value).toBe(taskId),
+    );
+
+    await user.type(screen.getByLabelText('Minutes studied'), '45');
+    await user.click(screen.getByRole('button', { name: 'Log session' }));
+
+    expect(statValue('Study time this week')).toBe('45m');
+    expect(await screen.findByRole('heading', { name: 'This week by task' })).toBeInTheDocument();
+
+    await waitFor(() => {
+      const stored = readStored();
+      expect(stored?.sessions).toHaveLength(1);
+      expect(stored?.sessions[0]).toMatchObject({ taskId, minutes: 45 });
+      expect(stored?.sessions[0]?.timestamp).toBeTruthy();
+    });
+  });
+
+  it('rejects invalid study minutes and leaves storage untouched', async () => {
+    const user = userEvent.setup();
+    await renderApp();
+    await quickAdd(user, 'Physics problem set');
+
+    const taskId = readStored()?.tasks[0]?.id ?? '';
+    await user.selectOptions(screen.getByLabelText('Task you studied'), taskId);
+    await user.type(screen.getByLabelText('Minutes studied'), '0');
+    await user.click(screen.getByRole('button', { name: 'Log session' }));
+
+    const minutesInput = screen.getByLabelText('Minutes studied');
+    expect(minutesInput).toHaveAttribute('aria-invalid', 'true');
+    expect(readStored()?.sessions ?? []).toHaveLength(0);
+    expect(statValue('Study time this week')).toBe('0m');
+
+    await user.clear(minutesInput);
+    await user.type(minutesInput, '30');
+    await user.click(screen.getByRole('button', { name: 'Log session' }));
+
+    expect(statValue('Study time this week')).toBe('30m');
+    await waitFor(() => expect(readStored()?.sessions).toHaveLength(1));
+    expect(minutesInput).toHaveAttribute('aria-invalid', 'false');
+  });
+
+  it('needs confirmation before deleting and never keeps sessions for a removed task', async () => {
+    const user = userEvent.setup();
+    await renderApp();
+    await quickAdd(user, 'Chemistry lab report');
+
+    const taskId = readStored()?.tasks[0]?.id ?? '';
+    await user.selectOptions(screen.getByLabelText('Task you studied'), taskId);
+    await user.type(screen.getByLabelText('Minutes studied'), '25');
+    await user.click(screen.getByRole('button', { name: 'Log session' }));
+    await waitFor(() => expect(readStored()?.sessions).toHaveLength(1));
+
+    await user.click(screen.getByRole('button', { name: 'Delete' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('Delete this task?')).toBeInTheDocument();
+    expect(within(dialog).getByText(/1 study session logged against this task/)).toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(within(tasksRegion()).getByText('Chemistry lab report')).toBeInTheDocument();
+    expect(readStored()?.tasks).toHaveLength(1);
+
+    await user.click(screen.getByRole('button', { name: 'Delete' }));
+    await user.click(
+      within(await screen.findByRole('dialog')).getByRole('button', { name: 'Delete task' }),
+    );
+
+    await waitFor(() => expect(readStored()?.tasks ?? []).toHaveLength(0));
+    // The session pointed at a task that no longer exists, so it goes too.
+    expect(readStored()?.sessions ?? []).toHaveLength(0);
+    expect(statValue('Tasks tracked')).toBe('0');
+  });
+
+  it('restores valid saved tasks on startup', async () => {
+    seedEnvelope([
+      makeTask({ id: 'a', title: 'Restored task', course: 'Biology', dueDate: toDateKey(new Date()) }),
+      makeTask({ id: 'b', title: 'Finished task', status: 'done' }),
+    ]);
+    await renderApp();
+
+    expect(screen.getByText('Restored task')).toBeInTheDocument();
+    expect(statValue('Tasks tracked')).toBe('2');
+    expect(statValue('Completed')).toBe('1');
+    expect(statValue('Due today')).toBe('1');
+  });
+
+  it('keeps unreadable saved data untouched and stays usable', async () => {
+    const malformed = '{ this is not json';
+    window.localStorage.setItem(STORAGE_KEY, malformed);
+    await renderApp();
+
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent(/welcome back to Studyspace/);
+    expect(screen.getByText('Saved data could not be read')).toBeInTheDocument();
+    // Nothing was replaced with defaults.
+    expect(window.localStorage.getItem(STORAGE_KEY)).toBe(malformed);
+    expect(screen.getByText('No tasks yet')).toBeInTheDocument();
+  });
+
+  it('filters by course and status and explains an empty result', async () => {
+    const user = userEvent.setup();
+    seedEnvelope([
+      makeTask({ id: 'a', title: 'Biology essay', course: 'Biology' }),
+      makeTask({ id: 'b', title: 'Calculus set', course: 'Math' }),
+    ]);
+    await renderApp();
+
+    const region = tasksRegion();
+    expect(within(region).getByText('Biology essay')).toBeInTheDocument();
+    expect(within(region).getByText('Calculus set')).toBeInTheDocument();
+
+    await user.selectOptions(within(region).getByLabelText('Course'), 'Biology');
+    expect(within(region).getByText('Biology essay')).toBeInTheDocument();
+    expect(within(region).queryByText('Calculus set')).toBeNull();
+
+    await user.selectOptions(within(region).getByLabelText('Status'), 'inProgress');
+    expect(within(region).queryByText('Biology essay')).toBeNull();
+    expect(within(region).getByText('No tasks match these filters')).toBeInTheDocument();
+
+    await user.click(within(region).getByRole('button', { name: 'Clear filters' }));
+    expect(within(region).getByText('Biology essay')).toBeInTheDocument();
+    expect(within(region).getByText('Calculus set')).toBeInTheDocument();
+  });
+
+  it('validates and creates a task through the full details dialog', async () => {
+    const user = userEvent.setup();
+    await renderApp();
+
+    await user.click(screen.getByRole('button', { name: 'Add a task with full details' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Add a task' });
+
+    await user.click(within(dialog).getByRole('button', { name: 'Add task' }));
+    expect(within(dialog).getByRole('alert')).toHaveTextContent(/needs attention/);
+    expect(within(dialog).getByLabelText(/Title/)).toHaveAttribute('aria-invalid', 'true');
+    expect(readStored()?.tasks ?? []).toHaveLength(0);
+
+    await user.type(within(dialog).getByLabelText(/Title/), 'Organic chemistry notes');
+    await user.clear(within(dialog).getByLabelText(/Course/));
+    await user.type(within(dialog).getByLabelText(/Course/), 'Chemistry');
+    await user.clear(within(dialog).getByLabelText(/Estimate/));
+    await user.type(within(dialog).getByLabelText(/Estimate/), 'ab');
+    await user.click(within(dialog).getByRole('button', { name: 'Add task' }));
+    expect(within(dialog).getByRole('alert')).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/Estimate/)).toHaveAttribute('aria-invalid', 'true');
+
+    await user.clear(within(dialog).getByLabelText(/Estimate/));
+    await user.type(within(dialog).getByLabelText(/Estimate/), '90');
+    await user.click(within(dialog).getByRole('button', { name: 'Add task' }));
+
+    await waitFor(() => expect(readStored()?.tasks).toHaveLength(1));
+    expect(readStored()?.tasks[0]).toMatchObject({
+      title: 'Organic chemistry notes',
+      course: 'Chemistry',
+      estimatedMinutes: 90,
+    });
+  });
+});

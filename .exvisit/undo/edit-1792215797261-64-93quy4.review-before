@@ -1,0 +1,214 @@
+/**
+ * Optional, fully local study planner.
+ *
+ * This is a *heuristic*, not AI: it never calls a network service, never reads
+ * an API key and never claims intelligence it does not have. It is a small,
+ * pure scheduling rule set:
+ *
+ *   - only open (not done) tasks are scheduled,
+ *   - work is ordered exactly like the task list (due date, then priority),
+ *   - a task with a due date inside the window is never scheduled after it,
+ *   - each day has a fixed budget of minutes, so long tasks spill forward,
+ *   - anything that does not fit inside the window is reported, not silently
+ *     dropped.
+ *
+ * The result is a *proposal*. Nothing is written to the store until the user
+ * reviews and approves it (see `Approve plan` in the plan view).
+ */
+import type { PlanDay, PlanItem, Task } from '../types';
+import { addDays, daysBetweenKeys, toDateKey } from './dates';
+import { compareTasks } from './tasks';
+
+export const PLAN_WINDOW_DAYS = 7;
+/** Minutes of study the planner is willing to place on a single day. */
+export const DAILY_BUDGET_MINUTES = 120;
+/** Fallback block length for a task the user gave no estimate for. */
+export const DEFAULT_TASK_MINUTES = 30;
+
+export interface PlanOptions {
+  /** How many days to plan. Defaults to a seven-day week. */
+  days?: number;
+  /** Daily minutes budget. Defaults to `DAILY_BUDGET_MINUTES`. */
+  dailyBudgetMinutes?: number;
+}
+
+/** The calendar keys covered by a plan starting at `now`. */
+export function planWindow(now: Date, days: number = PLAN_WINDOW_DAYS): string[] {
+  return Array.from({ length: days }, (_, index) => toDateKey(addDays(now, index)));
+}
+
+/**
+ * Distributes open tasks over the next `days` days.
+ * Deterministic: the same tasks, day and budget always give the same plan.
+ */
+export function buildSevenDayPlan(tasks: Task[], now: Date, options: PlanOptions = {}): PlanDay[] {
+  const days = Math.max(1, options.days ?? PLAN_WINDOW_DAYS);
+  const budget = Math.max(1, options.dailyBudgetMinutes ?? DAILY_BUDGET_MINUTES);
+  const todayKey = toDateKey(now);
+  const dates = planWindow(now, days);
+  const remaining = new Map<string, number>(dates.map((date) => [date, budget]));
+  const items: PlanItem[] = [];
+
+  const open = tasks.filter((task) => task.status !== 'done').slice().sort(compareTasks);
+
+  for (const task of open) {
+    let minutes = task.estimatedMinutes ?? DEFAULT_TASK_MINUTES;
+
+    // Never schedule an unchallenged task after its due date.
+    let startIndex = 0;
+    if (task.dueDate !== undefined && task.dueDate < dates[days - 1]) {
+      const delta = daysBetweenKeys(todayKey, task.dueDate);
+      if (Number.isFinite(delta)) startIndex = Math.min(Math.max(delta, 0), days - 1);
+    }
+
+    for (let index = startIndex; index < days && minutes > 0; index += 1) {
+      const date = dates[index];
+      const free = remaining.get(date) ?? 0;
+      if (free <= 0) continue;
+      const take = Math.min(free, minutes);
+      remaining.set(date, free - take);
+      minutes -= take;
+      items.push({ date, taskId: task.id, minutes: take });
+    }
+  }
+
+  return dates.map((date) => {
+    const dayItems = items.filter((item) => item.date === date);
+    return {
+      date,
+      items: dayItems,
+      totalMinutes: dayItems.reduce((total, item) => total + item.minutes, 0),
+    };
+  });
+}
+
+export interface PlanTotals {
+  totalMinutes: number;
+  /** One entry per scheduled task/day block. */
+  blockCount: number;
+  taskIds: string[];
+}
+
+export function planTotals(plan: PlanDay[]): PlanTotals {
+  const taskIds = new Set<string>();
+  let totalMinutes = 0;
+  let blockCount = 0;
+  for (const day of plan) {
+    for (const item of day.items) {
+      totalMinutes += item.minutes;
+      blockCount += 1;
+      taskIds.add(item.taskId);
+    }
+  }
+  return { totalMinutes, blockCount, taskIds: [...taskIds] };
+}
+
+/** Open tasks the plan could not fit inside the window. */
+export function unplannedTasks(tasks: Task[], plan: PlanDay[]): Task[] {
+  const planned = new Set(planTotals(plan).taskIds);
+  return tasks.filter((task) => task.status !== 'done' && !planned.has(task.id));
+}
+
+export type PlanMoveResult =
+  | { ok: true; plan: PlanDay[] }
+  | { ok: false; reason: string };
+
+function withTotals(plan: PlanDay[]): PlanDay[] {
+  return plan.map((day) => ({
+    ...day,
+    totalMinutes: day.items.reduce((total, item) => total + item.minutes, 0),
+  }));
+}
+
+/**
+ * Moves one planned block to another day, refusing when the target day has no
+ * budget left. Moving onto a day that already holds the same task merges the
+ * two blocks instead of duplicating them.
+ */
+export function movePlanItem(
+  plan: PlanDay[],
+  taskId: string,
+  fromDate: string,
+  toDate: string,
+  dailyBudgetMinutes: number = DAILY_BUDGET_MINUTES,
+): PlanMoveResult {
+  if (fromDate === toDate) return { ok: true, plan };
+
+  const source = plan.find((day) => day.date === fromDate);
+  const item = source?.items.find((entry) => entry.taskId === taskId);
+  if (!source || !item) {
+    return { ok: false, reason: 'That block is no longer in the plan.' };
+  }
+
+  const target = plan.find((day) => day.date === toDate);
+  if (!target) {
+    return { ok: false, reason: 'That day is outside the planned week.' };
+  }
+
+  if (target.totalMinutes + item.minutes > dailyBudgetMinutes) {
+    const free = Math.max(0, dailyBudgetMinutes - target.totalMinutes);
+    return {
+      ok: false,
+      reason: `That day only has ${free} minutes of planned time left, but this block needs ${item.minutes}.`,
+    };
+  }
+
+  const next = plan.map((day) => {
+    if (day.date === fromDate) {
+      return { ...day, items: day.items.filter((entry) => entry.taskId !== taskId) };
+    }
+    if (day.date === toDate) {
+      const existing = day.items.find((entry) => entry.taskId === taskId);
+      const items = existing
+        ? day.items.map((entry) =>
+            entry.taskId === taskId ? { ...entry, minutes: entry.minutes + item.minutes } : entry,
+          )
+        : [...day.items, { ...item, date: toDate }];
+      return { ...day, items };
+    }
+    return day;
+  });
+
+  return { ok: true, plan: withTotals(next) };
+}
+
+/**
+ * Drops every block that belongs to one task. Called when the task is deleted
+ * so an approved plan can never point at a task that no longer exists.
+ */
+export function removeTaskFromPlan(plan: PlanDay[], taskId: string): PlanDay[] {
+  return withTotals(
+    plan.map((day) => ({ ...day, items: day.items.filter((item) => item.taskId !== taskId) })),
+  );
+}
+
+/** Drops one planned block, e.g. when the user wants it out of the week. */
+export function removePlanItem(plan: PlanDay[], taskId: string, date: string): PlanDay[] {
+  return withTotals(
+    plan.map((day) =>
+      day.date === date
+        ? { ...day, items: day.items.filter((item) => item.taskId !== taskId) }
+        : day,
+    ),
+  );
+}
+
+/** The first day a task appears in the plan, or `null` when it is unscheduled. */
+export function firstPlannedDate(plan: PlanDay[], taskId: string): string | null {
+  for (const day of plan) {
+    if (day.items.some((item) => item.taskId === taskId)) return day.date;
+  }
+  return null;
+}
+
+/**
+ * Applying an approved plan fills in a due date for every planned task that
+ * does not have one yet. Tasks the student already dated are left alone.
+ */
+export function applyPlanDueDates(tasks: Task[], plan: PlanDay[]): Task[] {
+  return tasks.map((task) => {
+    if (task.dueDate !== undefined) return task;
+    const date = firstPlannedDate(plan, task.id);
+    return date === null ? task : { ...task, dueDate: date };
+  });
+}

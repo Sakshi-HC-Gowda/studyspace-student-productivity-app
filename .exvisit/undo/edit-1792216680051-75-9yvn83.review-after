@@ -1,0 +1,464 @@
+import { useMemo, useRef, useState } from 'react';
+import type { PlanDay, Task, ViewKey } from './types';
+import { Banner } from './components/Banner';
+import { ConfirmDialog } from './components/ConfirmDialog';
+import { FilterBar } from './components/FilterBar';
+import { PlanView } from './components/PlanView';
+import { QuickAdd } from './components/QuickAdd';
+import { Sidebar } from './components/Sidebar';
+import { StudyPanel } from './components/StudyPanel';
+import { SummaryCards } from './components/SummaryCards';
+import { TaskFormDialog } from './components/TaskFormDialog';
+import { TaskList } from './components/TaskList';
+import { useStudyspace } from './hooks/useStudyspace';
+import { formatDateKey, formatMinutes, formatWeekRange, toDateKey } from './utils/dates';
+import {
+  defaultFilters,
+  describeEmptyState,
+  filterByView,
+  selectTasks,
+  type TaskFilters,
+} from './utils/filters';
+import { applyPlanDueDates, buildSevenDayPlan, removeTaskFromPlan } from './utils/plan';
+import { minutesByTask, computeStudyProgress, weeklyStudyMinutes } from './utils/study';
+import {
+  GENERAL_COURSE,
+  collectCourses,
+  draftFromTask,
+  emptyDraft,
+  isDueToday,
+  isOverdue,
+} from './utils/tasks';
+
+const VIEW_TITLE: Record<ViewKey, string> = {
+  all: 'All open tasks',
+  today: 'Due today and overdue',
+  upcoming: 'Upcoming',
+  completed: 'Completed',
+  plan: 'Plan the week',
+};
+
+const SORT_NOTE: Record<ViewKey, string> = {
+  all: 'Sorted by due date, then priority.',
+  today: 'Sorted by due date, then priority. Overdue work is flagged.',
+  upcoming: 'Sorted by due date, then priority.',
+  completed: 'Most recently created first.',
+  plan: 'Proposal only — nothing is saved until you approve it.',
+};
+
+function greeting(now: Date): string {
+  const hour = now.getHours();
+  if (hour < 12) return 'Good morning';
+  if (hour < 18) return 'Good afternoon';
+  return 'Good evening';
+}
+
+/** The whole dashboard. All state lives here; the components stay presentational. */
+export function App() {
+  const {
+    phase,
+    tasks,
+    sessions,
+    notices,
+    loadStatus,
+    storageWritable,
+    dismissNotice,
+    pushNotice,
+    addTask,
+    updateTask,
+    replaceTasks,
+    setTaskStatus,
+    toggleTaskDone,
+    deleteTask,
+    logSession,
+    resetStorage,
+  } = useStudyspace();
+
+  const [view, setView] = useState<ViewKey>('all');
+  const [filters, setFilters] = useState<TaskFilters>(defaultFilters);
+  const [quickCourse, setQuickCourse] = useState<string>(GENERAL_COURSE);
+  const [now, setNow] = useState<Date>(() => new Date());
+  const [selectedTaskId, setSelectedTaskId] = useState<string>('');
+  const [formOpen, setFormOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<Task | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<Task | null>(null);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [plan, setPlan] = useState<PlanDay[] | null>(null);
+  const [planApproved, setPlanApproved] = useState(false);
+  const studyRef = useRef<HTMLDivElement>(null);
+
+  const courses = useMemo(() => collectCourses(tasks), [tasks]);
+  const visible = useMemo(
+    () => selectTasks({ tasks, view, filters, now }),
+    [tasks, view, filters, now],
+  );
+  const advice = useMemo(
+    () => describeEmptyState(tasks, view, filters, now),
+    [tasks, view, filters, now],
+  );
+  const progress = useMemo(() => computeStudyProgress(tasks, sessions, now), [tasks, sessions, now]);
+  const loggedByTask = useMemo(() => minutesByTask(sessions), [sessions]);
+
+  const counts: Record<ViewKey, number> = {
+    all: filterByView(tasks, 'all', now).length,
+    today: filterByView(tasks, 'today', now).length,
+    upcoming: filterByView(tasks, 'upcoming', now).length,
+    completed: filterByView(tasks, 'completed', now).length,
+    plan: filterByView(tasks, 'plan', now).length,
+  };
+
+  const openCount = counts.all;
+  const dueToday = tasks.filter((task) => isDueToday(task, now)).length;
+  const overdue = tasks.filter((task) => isOverdue(task, now)).length;
+  const weekRange = formatWeekRange(now);
+  const weekStudy = weeklyStudyMinutes(sessions, now);
+
+  const storageLabel = !storageWritable
+    ? 'Changes are kept in this tab only'
+    : loadStatus === 'empty'
+      ? 'Nothing saved yet'
+      : loadStatus === 'repaired'
+        ? 'Saved data was repaired'
+        : loadStatus === 'unreadable'
+          ? 'Stored data could not be read'
+          : 'Saved in this browser';
+
+  const visibleNotices = notices.slice(-4);
+
+  // ---- task actions --------------------------------------------------------------
+  function openCreateDialog() {
+    setEditingTask(null);
+    setFormOpen(true);
+  }
+
+  function openEditDialog(task: Task) {
+    setEditingTask(task);
+    setFormOpen(true);
+  }
+
+  function handleSubmitTask(input: Parameters<typeof addTask>[0]) {
+    if (editingTask === null) {
+      addTask(input);
+    } else {
+      updateTask(editingTask.id, input);
+    }
+    setFormOpen(false);
+    setEditingTask(null);
+  }
+
+  function handleQuickAdd(title: string) {
+    addTask({
+      title,
+      course: quickCourse === '' ? GENERAL_COURSE : quickCourse,
+      priority: 'medium',
+      status: 'todo',
+    });
+  }
+
+  function confirmDelete() {
+    if (pendingDelete === null) return;
+    if (plan !== null) setPlan(removeTaskFromPlan(plan, pendingDelete.id));
+    deleteTask(pendingDelete.id);
+    if (selectedTaskId === pendingDelete.id) setSelectedTaskId('');
+    setPendingDelete(null);
+  }
+
+  const sessionsForPendingDelete =
+    pendingDelete === null ? 0 : sessions.filter((session) => session.taskId === pendingDelete.id).length;
+
+  // ---- study actions -------------------------------------------------------------
+  function handleLogStudy(task: Task) {
+    setSelectedTaskId(task.id);
+    requestAnimationFrame(() => {
+      studyRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      const input = document.getElementById('session-minutes');
+      if (input instanceof HTMLInputElement) input.focus();
+    });
+  }
+
+  function handleLogSession(draft: { taskId: string; minutes: string }) {
+    const result = logSession(draft);
+    if (result.ok) {
+      const task = tasks.find((entry) => entry.id === draft.taskId);
+      pushNotice('info', `Logged ${formatMinutes(Number(draft.minutes))} on “${task?.title ?? 'task'}”.`);
+    }
+    return result;
+  }
+
+  // ---- plan actions -------------------------------------------------------------
+  function generatePlan() {
+    setPlan(buildSevenDayPlan(tasks, now));
+    setPlanApproved(false);
+  }
+
+  function approvePlan() {
+    if (plan === null) return;
+    replaceTasks(applyPlanDueDates(tasks, plan));
+    setPlanApproved(true);
+    pushNotice(
+      'info',
+      'Plan approved. Tasks that had no due date now sit on their planned day; nothing else changed.',
+    );
+  }
+
+  function refreshToday() {
+    setNow(new Date());
+  }
+
+  function handleEmptyAction() {
+    if (advice.kind === 'no-tasks') openCreateDialog();
+    else if (advice.kind === 'no-matches') setFilters(defaultFilters());
+  }
+
+  const emptyActionLabel =
+    advice.kind === 'no-tasks'
+      ? 'Add a task'
+      : advice.kind === 'no-matches'
+        ? 'Clear filters'
+        : undefined;
+
+  return (
+    <div className="app">
+      <a className="skip-link" href="#main">
+        Skip to main content
+      </a>
+
+      <Sidebar
+        view={view}
+        counts={counts}
+        onSelect={setView}
+        storageLabel={storageLabel}
+        storageWritable={storageWritable}
+        weekLabel={weekRange}
+      />
+
+      <div className="shell">
+        <header className="welcome">
+          <div className="welcome__text">
+            <p className="welcome__eyebrow">
+              {formatDateKey(toDateKey(now))} · week of {weekRange} · {formatMinutes(weekStudy)} studied
+            </p>
+            <h1 className="welcome__title">{greeting(now)} — welcome back to Studyspace</h1>
+            <p className="welcome__body">
+              {openCount === 0
+                ? 'No open tasks right now.'
+                : `${openCount} open ${openCount === 1 ? 'task' : 'tasks'}: ${dueToday} due today, ${overdue} overdue.`}
+            </p>
+          </div>
+          <div className="welcome__actions">
+            <button type="button" className="button button--ghost" onClick={refreshToday}>
+              Refresh today
+            </button>
+            <button type="button" className="button button--primary" onClick={openCreateDialog}>
+              Add task
+            </button>
+          </div>
+        </header>
+
+        <div className="notices">
+          {!storageWritable && loadStatus === 'unreadable' ? (
+            <Banner
+              level="error"
+              title="Saved data could not be read"
+              actions={
+                <button
+                  type="button"
+                  className="button button--danger button--small"
+                  onClick={() => setConfirmReset(true)}
+                >
+                  Clear stored data…
+                </button>
+              }
+            >
+              <p>
+                The data in this browser is not valid Studyspace data, so nothing was replaced. You can
+                keep working — your changes stay in this tab — or clear the stored payload to start
+                saving again.
+              </p>
+            </Banner>
+          ) : null}
+
+          {visibleNotices.map((entry) => (
+            <Banner
+              key={entry.id}
+              level={entry.level}
+              title={
+                entry.level === 'error'
+                  ? 'Something went wrong'
+                  : entry.level === 'warning'
+                    ? 'Heads up'
+                    : 'Done'
+              }
+              onDismiss={() => dismissNotice(entry.id)}
+            >
+              <p>{entry.text}</p>
+            </Banner>
+          ))}
+        </div>
+
+        {phase === 'loading' ? (
+          <main className="content" id="main">
+            <div className="card loading" role="status" aria-live="polite">
+              <p className="loading__title">Loading your tasks…</p>
+              <p className="note">Reading the data saved in this browser.</p>
+              <ul className="skeleton" aria-hidden="true">
+                <li />
+                <li />
+                <li />
+              </ul>
+            </div>
+          </main>
+        ) : (
+          <main className="content" id="main">
+            <SummaryCards
+              total={tasks.length}
+              open={openCount}
+              completed={counts.completed}
+              dueToday={dueToday}
+              overdue={overdue}
+              percentComplete={progress.percentComplete}
+              weeklyMinutes={formatMinutes(progress.weeklyMinutes)}
+              weekRange={weekRange}
+            />
+
+            <div className="columns">
+              <div className="column column--wide">
+                {view === 'plan' ? (
+                  <PlanView
+                    tasks={tasks}
+                    plan={plan}
+                    approved={planApproved}
+                    onGenerate={generatePlan}
+                    onChange={(next) => {
+                      setPlan(next);
+                      if (next === null) setPlanApproved(false);
+                    }}
+                    onApprove={approvePlan}
+                  />
+                ) : (
+                  <>
+                    <QuickAdd
+                      courses={courses}
+                      course={quickCourse}
+                      onChangeCourse={setQuickCourse}
+                      onAdd={handleQuickAdd}
+                      onOpenDetails={openCreateDialog}
+                    />
+
+                    <section className="card" aria-labelledby="tasks-heading">
+                      <div className="card__head">
+                        <h2 className="card__title" id="tasks-heading">
+                          {VIEW_TITLE[view]}
+                        </h2>
+                        <p className="card__subtitle">{SORT_NOTE[view]}</p>
+                      </div>
+
+                      <FilterBar
+                        filters={filters}
+                        courses={courses}
+                        view={view}
+                        resultCount={visible.length}
+                        totalCount={counts[view]}
+                        onChange={setFilters}
+                      />
+
+                      <TaskList
+                        tasks={visible}
+                        now={now}
+                        minutesByTask={loggedByTask}
+                        grouped={view !== 'completed'}
+                        advice={advice}
+                        emptyActionLabel={emptyActionLabel}
+                        onEmptyAction={emptyActionLabel === undefined ? undefined : handleEmptyAction}
+                        onToggleDone={toggleTaskDone}
+                        onSetStatus={setTaskStatus}
+                        onEdit={openEditDialog}
+                        onDelete={setPendingDelete}
+                        onLogStudy={handleLogStudy}
+                      />
+                    </section>
+                  </>
+                )}
+              </div>
+
+              <div className="column" ref={studyRef}>
+                <StudyPanel
+                  tasks={tasks}
+                  sessions={sessions}
+                  now={now}
+                  progress={progress}
+                  weekRange={weekRange}
+                  selectedTaskId={selectedTaskId}
+                  onSelectTask={setSelectedTaskId}
+                  onLogSession={handleLogSession}
+                  onAddTask={openCreateDialog}
+                />
+              </div>
+            </div>
+          </main>
+        )}
+
+        <footer className="footer">
+          <p>
+            Studyspace keeps everything in this browser under the versioned localStorage key{' '}
+            <code>studyspace:data</code> (envelope version 1). No account, no server, no network
+            requests.
+          </p>
+          <p>
+            Course filter options come from your own tasks. Weeks run Monday to Sunday, local time.
+          </p>
+        </footer>
+      </div>
+
+      <TaskFormDialog
+        open={formOpen}
+        mode={editingTask === null ? 'create' : 'edit'}
+        initial={editingTask === null ? emptyDraft() : draftFromTask(editingTask)}
+        courses={courses}
+        onCancel={() => {
+          setFormOpen(false);
+          setEditingTask(null);
+        }}
+        onSubmit={handleSubmitTask}
+      />
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        title="Delete this task?"
+        confirmLabel="Delete task"
+        onConfirm={confirmDelete}
+        onCancel={() => setPendingDelete(null)}
+      >
+        <p>
+          “{pendingDelete?.title ?? ''}” will be removed from your list. This cannot be undone.
+        </p>
+        {sessionsForPendingDelete > 0 ? (
+          <p className="note note--warn">
+            {sessionsForPendingDelete}{' '}
+            {sessionsForPendingDelete === 1 ? 'study session' : 'study sessions'} logged against this
+            task will be deleted too, so no study time points at a missing task.
+          </p>
+        ) : null}
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={confirmReset}
+        title="Clear stored data?"
+        confirmLabel="Clear stored data"
+        onConfirm={() => {
+          setConfirmReset(false);
+          setPlan(null);
+          setPlanApproved(false);
+          setFilters(defaultFilters());
+          resetStorage();
+        }}
+        onCancel={() => setConfirmReset(false)}
+      >
+        <p>
+          This replaces the unreadable payload in this browser with a fresh, empty Studyspace. Use the
+          browser’s developer tools if you want to copy the old value out first.
+        </p>
+      </ConfirmDialog>
+    </div>
+  );
+}

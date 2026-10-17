@@ -1,0 +1,188 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { BACKUP_KEY, LEGACY_KEYS, parseStoredState, serializeState } from './storage';
+
+const VALID_TASK = {
+  id: 't1',
+  title: 'Read chapter 4',
+  course: 'Biology',
+  dueDate: '2026-03-09',
+  priority: 'high',
+  estimatedMinutes: 45,
+  status: 'todo',
+  createdAt: '2026-03-01T08:00:00.000Z',
+};
+
+const VALID_SESSION = {
+  id: 's1',
+  taskId: 't1',
+  minutes: 30,
+  timestamp: '2026-03-04T09:00:00.000Z',
+};
+
+beforeEach(() => {
+  window.localStorage.clear();
+});
+
+describe('parseStoredState', () => {
+  it('treats missing data as an empty, non-error state', () => {
+    const result = parseStoredState(null);
+    expect(result.status).toBe('empty');
+    expect(result.data).toEqual({ tasks: [], sessions: [] });
+    expect(result.issues).toEqual([]);
+  });
+
+  it('round-trips a valid payload', () => {
+    const serialized = serializeState({ tasks: [VALID_TASK as never], sessions: [VALID_SESSION as never] });
+    const result = parseStoredState(serialized);
+    expect(result.status).toBe('loaded');
+    expect(result.data.tasks).toHaveLength(1);
+    expect(result.data.sessions).toHaveLength(1);
+    expect(result.shouldRewrite).toBe(false);
+    expect(JSON.parse(serialized).version).toBe(1);
+  });
+
+  it('refuses to treat malformed JSON as an empty workspace', () => {
+    const result = parseStoredState('{ not json');
+    expect(result.status).toBe('unreadable');
+    expect(result.shouldRewrite).toBe(false);
+    expect(result.issues[0]).toContain('could not be read');
+  });
+
+  it('refuses a payload written by a newer version', () => {
+    const result = parseStoredState(JSON.stringify({ version: 99, tasks: [VALID_TASK], sessions: [] }));
+    expect(result.status).toBe('unreadable');
+    expect(result.shouldRewrite).toBe(false);
+    expect(result.issues[0]).toContain('newer version');
+  });
+
+  it('refuses a payload without a version marker or task list', () => {
+    expect(parseStoredState(JSON.stringify({ hello: 'world' })).status).toBe('unreadable');
+    expect(parseStoredState(JSON.stringify([1, 2, 3])).status).toBe('unreadable');
+    expect(parseStoredState('42').status).toBe('unreadable');
+  });
+
+  it('keeps valid records and drops only the broken ones', () => {
+    const result = parseStoredState(
+      JSON.stringify({
+        version: 1,
+        tasks: [VALID_TASK, { id: 'broken' }, null, 'nope'],
+        sessions: [],
+      }),
+    );
+    expect(result.status).toBe('repaired');
+    expect(result.data.tasks.map((t) => t.id)).toEqual(['t1']);
+    expect(result.shouldRewrite).toBe(true);
+    expect(result.issues.join(' ')).toContain('3 saved tasks');
+  });
+
+  it('drops duplicate task ids', () => {
+    const result = parseStoredState(
+      JSON.stringify({ version: 1, tasks: [VALID_TASK, { ...VALID_TASK }], sessions: [] }),
+    );
+    expect(result.data.tasks).toHaveLength(1);
+    expect(result.issues.join(' ')).toContain('skipped');
+  });
+
+  it('never keeps a study session that references a missing task', () => {
+    const result = parseStoredState(
+      JSON.stringify({
+        version: 1,
+        tasks: [VALID_TASK],
+        sessions: [VALID_SESSION, { id: 's2', taskId: 'ghost', minutes: 20, timestamp: '2026-03-04T09:00:00.000Z' }],
+      }),
+    );
+    expect(result.data.sessions.map((s) => s.id)).toEqual(['s1']);
+    expect(result.issues.join(' ')).toContain('missing task');
+  });
+
+  it('drops a session whose task was dropped as invalid', () => {
+    const result = parseStoredState(
+      JSON.stringify({ version: 1, tasks: [{ id: 'bad' }], sessions: [VALID_SESSION] }),
+    );
+    expect(result.data.tasks).toEqual([]);
+    expect(result.data.sessions).toEqual([]);
+  });
+
+  it('migrates an unversioned v0 payload forward', () => {
+    const result = parseStoredState(JSON.stringify({ tasks: [VALID_TASK], sessions: [] }));
+    expect(result.status).toBe('legacy-migrated');
+    expect(result.data.tasks).toHaveLength(1);
+    expect(result.shouldRewrite).toBe(true);
+    expect(result.issues[0]).toContain('migrated');
+  });
+
+  it('treats a missing task array as empty rather than fatal', () => {
+    const result = parseStoredState(JSON.stringify({ version: 1, sessions: [] }));
+    expect(result.status).toBe('repaired');
+    expect(result.data.tasks).toEqual([]);
+    expect(result.issues.join(' ')).toContain('No valid task list');
+  });
+});
+
+describe('loadState integration with localStorage', () => {
+  it('does not overwrite unreadable data and keeps a backup copy', async () => {
+    const { loadState, STORAGE_KEY } = await import('./storage');
+    const corrupt = '{ definitely not json';
+    window.localStorage.setItem(STORAGE_KEY, corrupt);
+
+    const result = loadState();
+    expect(result.status).toBe('unreadable');
+    expect(result.data).toEqual({ tasks: [], sessions: [] });
+    // The original payload is untouched, so nothing valid is replaced by defaults.
+    expect(window.localStorage.getItem(STORAGE_KEY)).toBe(corrupt);
+    expect(window.localStorage.getItem(BACKUP_KEY)).toBe(corrupt);
+    expect(result.issues.join(' ')).toContain(BACKUP_KEY);
+  });
+
+  it('reads back exactly what was saved', async () => {
+    const { loadState, saveState } = await import('./storage');
+    const write = saveState({ tasks: [VALID_TASK as never], sessions: [VALID_SESSION as never] });
+    expect(write.ok).toBe(true);
+    const result = loadState();
+    expect(result.status).toBe('loaded');
+    expect(result.data.tasks[0]?.id).toBe('t1');
+    expect(result.data.sessions[0]?.minutes).toBe(30);
+  });
+
+  it('reports a storage read failure without throwing', async () => {
+    const { loadState } = await import('./storage');
+    // jsdom keeps localStorage's accessors on Storage.prototype, so patch there.
+    const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      const error = new Error('blocked');
+      error.name = 'SecurityError';
+      throw error;
+    });
+    try {
+      const result = loadState();
+      expect(result.status).toBe('empty');
+      expect(result.readError).toContain('private browsing');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('reports a storage write failure without throwing', async () => {
+    const { saveState } = await import('./storage');
+    const spy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      const error = new Error('full');
+      error.name = 'QuotaExceededError';
+      throw error;
+    });
+    try {
+      const result = saveState({ tasks: [], sessions: [] });
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('storage is full');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('imports tasks from a legacy key when the versioned key is empty', async () => {
+    const { loadState } = await import('./storage');
+    window.localStorage.setItem(LEGACY_KEYS[0], JSON.stringify([VALID_TASK]));
+    const result = loadState();
+    expect(result.status).toBe('legacy-migrated');
+    expect(result.data.tasks.map((t) => t.id)).toEqual(['t1']);
+    expect(result.issues[0]).toContain(LEGACY_KEYS[0]);
+  });
+});
